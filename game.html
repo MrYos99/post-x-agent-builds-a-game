@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>NEON DODGE — built from one prompt</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #050510; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="game" width="1920" height="1080"></canvas>
+<script>
+'use strict';
+// NEON DODGE — a tiny browser game built from ONE prompt:
+// "Build a tiny browser game: NEON DODGE. A little neon ship dodges
+//  falling meteors — steer with arrow keys, each dodge scores a point,
+//  one hit ends the run, Space restarts. Dark space, glowing ship,
+//  score top-left."
+//
+// The game is fully deterministic in time: ?t=<ms> renders the exact
+// frame at that game-time (used to film it), otherwise it runs live
+// with keyboard steering, and the autopilot takes over when you idle.
+
+const W = 1920, H = 1080;
+const SHIP_Y = 930, SHIP_R = 26;
+const SPAWN_EVERY = 650;          // ms between meteors
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+// ---- seeded rng (mulberry32) so every run plays the same meteors ----
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// ---- meteor schedule: pure function of the spawn index ----
+const rng = mulberry32(1337);
+const schedule = [];
+function meteorAt(i) {
+  while (schedule.length <= i) {
+    const k = schedule.length;
+    schedule.push({
+      spawn: k * SPAWN_EVERY,
+      x: 90 + rng() * (W - 180),
+      radius: 26 + rng() * 20,
+      speed: 0.42 + rng() * 0.14,      // px per ms
+      drift: (rng() - 0.5) * 0.12,     // px per ms sideways
+      hue: rng() < 0.5 ? '255,90,60' : '255,170,60'
+    });
+  }
+  return schedule[i];
+}
+
+// ---- stars: fixed, seeded ----
+const starRng = mulberry32(99);
+const stars = [];
+for (let i = 0; i < 160; i++) {
+  stars.push({ x: starRng() * W, y: starRng() * H, r: 0.6 + starRng() * 1.8, a: 0.25 + starRng() * 0.6 });
+}
+
+// ---- autopilot: pick the x with the most room from every meteor above ----
+function autopilotTarget(shipX, meteors) {
+  let bestX = shipX, bestScore = -1e9;
+  for (let d = -480; d <= 480; d += 60) {
+    const cand = Math.max(70, Math.min(W - 70, shipX + d));
+    let clearance = 1e9;
+    for (const m of meteors) {
+      const dy = SHIP_Y - m.y;
+      if (dy > -40 && dy < 480) {
+        clearance = Math.min(clearance, Math.abs(m.x - cand) - m.radius);
+      }
+    }
+    // prefer room, then staying near the middle, then small moves
+    const score = clearance - Math.abs(cand - W / 2) * 0.05 - Math.abs(d) * 0.02;
+    if (score > bestScore) { bestScore = score; bestX = cand; }
+  }
+  return bestX;
+}
+
+// ---- the simulation: one object, stepped forward in time ----
+function newSim() {
+  return { t: 0, shipX: 960, score: 0, over: false, overAt: 0, meteors: [], passed: new Set() };
+}
+
+function simStep(s, dt, steer) {
+  // steer: -1 left, +1 right, 0 autopilot — returns nothing, mutates s
+  s.t += dt;
+  // spawn + move meteors
+  const n = Math.floor(s.t / SPAWN_EVERY) + 1;
+  const live = [];
+  for (let i = 0; i < n; i++) {
+    const m = meteorAt(i);
+    const age = s.t - m.spawn;
+    if (age < 0) continue;
+    const y = -60 + age * m.speed;
+    if (y > H + 80) {
+      if (!s.passed.has(i)) { s.passed.add(i); s.score++; }
+      continue;
+    }
+    live.push({ x: m.x + age * m.drift, y, radius: m.radius, hue: m.hue });
+  }
+  s.meteors = live;
+  // move the ship
+  if (steer !== 0) {
+    s.shipX = Math.max(70, Math.min(W - 70, s.shipX + steer * 0.9 * dt));
+  } else {
+    const target = autopilotTarget(s.shipX, live);
+    const delta = target - s.shipX;
+    const move = Math.max(-0.9 * dt, Math.min(0.9 * dt, delta));
+    s.shipX += move;
+  }
+  // collision
+  if (!s.over) {
+    for (const m of live) {
+      const dx = m.x - s.shipX, dy = m.y - SHIP_Y;
+      const rr = m.radius + SHIP_R - 6;
+      if (dx * dx + dy * dy < rr * rr) { s.over = true; s.overAt = s.t; break; }
+    }
+  }
+}
+
+// Render one exact frame at game-time t (autopilot flies it).
+function stateAt(t) {
+  const s = newSim();
+  for (let now = 0; now < t; now += 16) simStep(s, Math.min(16, t - now), 0);
+  return s;
+}
+
+// ---- drawing a state ----
+function draw(s) {
+  ctx.fillStyle = '#050510';
+  ctx.fillRect(0, 0, W, H);
+  for (const st of stars) {
+    ctx.globalAlpha = st.a;
+    ctx.fillStyle = '#cfe6ff';
+    ctx.beginPath(); ctx.arc(st.x, st.y, st.r, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // meteors
+  for (const m of s.meteors) {
+    const g = ctx.createRadialGradient(m.x, m.y, 2, m.x, m.y, m.radius * 2.2);
+    g.addColorStop(0, `rgba(${m.hue},0.95)`);
+    g.addColorStop(0.45, `rgba(${m.hue},0.45)`);
+    g.addColorStop(1, `rgba(${m.hue},0)`);
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(m.x, m.y, m.radius * 2.2, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = `rgb(${m.hue})`;
+    ctx.beginPath(); ctx.arc(m.x, m.y, m.radius, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,0.35)';
+    ctx.beginPath(); ctx.arc(m.x - m.radius * 0.3, m.y - m.radius * 0.3, m.radius * 0.45, 0, Math.PI * 2); ctx.fill();
+  }
+
+  // ship (neon triangle, glowing)
+  ctx.save();
+  ctx.translate(s.shipX, SHIP_Y);
+  ctx.shadowColor = '#39d5ff'; ctx.shadowBlur = 34;
+  ctx.fillStyle = '#39d5ff';
+  ctx.beginPath();
+  ctx.moveTo(0, -34); ctx.lineTo(24, 22); ctx.lineTo(0, 10); ctx.lineTo(-24, 22);
+  ctx.closePath(); ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = '#eafcff';
+  ctx.beginPath();
+  ctx.moveTo(0, -22); ctx.lineTo(10, 14); ctx.lineTo(0, 7); ctx.lineTo(-10, 14);
+  ctx.closePath(); ctx.fill();
+  ctx.restore();
+
+  // HUD
+  ctx.fillStyle = '#ffffff';
+  ctx.font = '700 44px "Liberation Sans", sans-serif';
+  ctx.fillText('NEON DODGE', 48, 74);
+  ctx.font = '700 84px "Liberation Sans", sans-serif';
+  ctx.fillStyle = '#39d5ff';
+  ctx.fillText(String(s.score).padStart(3, '0'), 48, 168);
+  ctx.font = '400 30px "Liberation Sans", sans-serif';
+  ctx.fillStyle = 'rgba(255,255,255,0.75)';
+  ctx.fillText('SCORE', 50, 210);
+  ctx.fillStyle = 'rgba(255,255,255,0.55)';
+  ctx.font = '400 28px "Liberation Sans", sans-serif';
+  ctx.fillText('one prompt  →  this game  ·  make.fun', 48, H - 44);
+  ctx.textAlign = 'right';
+  ctx.fillText('← → steer   ·   SPACE restart', W - 48, H - 44);
+  ctx.textAlign = 'left';
+
+  if (s.over) {
+    ctx.fillStyle = 'rgba(5,5,16,0.72)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#ff5a3c';
+    ctx.font = '700 120px "Liberation Sans", sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('GAME OVER', W / 2, H / 2 - 20);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '400 44px "Liberation Sans", sans-serif';
+    ctx.fillText('score ' + s.score + '  ·  press SPACE to restart', W / 2, H / 2 + 60);
+    ctx.textAlign = 'left';
+  }
+}
+
+// ---- boot: ?t=<ms> films one frame, otherwise play live ----
+const params = new URLSearchParams(location.search);
+const fixedT = params.get('t');
+if (fixedT !== null) {
+  draw(stateAt(parseInt(fixedT, 10) || 0));
+} else {
+  let sim = newSim();
+  const keys = {};
+  addEventListener('keydown', (e) => {
+    keys[e.key] = true;
+    if (e.key === ' ' && sim.over) sim = newSim();
+  });
+  addEventListener('keyup', (e) => { keys[e.key] = false; });
+  let last = performance.now();
+  (function loop(now) {
+    const dt = Math.min(50, now - last);
+    last = now;
+    if (!sim.over) {
+      const steer = (keys.ArrowRight ? 1 : 0) - (keys.ArrowLeft ? 1 : 0);
+      simStep(sim, dt, steer);
+    }
+    draw(sim);
+    requestAnimationFrame(loop);
+  })(last);
+}
+</script>
+</body>
+</html>
